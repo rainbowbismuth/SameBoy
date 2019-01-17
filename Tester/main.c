@@ -28,6 +28,10 @@ static char *filename;
 static char *bmp_filename;
 static char *log_filename;
 static FILE *log_file;
+
+static bool write_sav = false;
+static char *sav_filename;
+
 static void replace_extension(const char *src, size_t length, char *dest, const char *ext);
 static bool push_start_a, start_is_not_first, a_is_bad, b_is_confirm, push_faster, push_slower,
             do_not_stop, push_a_twice, start_is_bad, allow_weird_sp_values, large_stack, push_right;
@@ -59,13 +63,13 @@ static void vblank(GB_gameboy_t *gb)
     /* Do not press any buttons during the last two seconds, this might cause a
        screenshot to be taken while the LCD is off if the press makes the game
        load graphics. */
-    if (push_start_a && (frames < test_length - 120 || do_not_stop)) { 
+    if (push_start_a && (frames < test_length - 120 || do_not_stop)) {
         unsigned combo_length = 40;
         if (start_is_not_first || push_a_twice) combo_length = 60; /* The start item in the menu is not the first, so also push down */
         else if (a_is_bad || start_is_bad) combo_length = 20; /* Pressing A has a negative effect (when trying to start the game). */
 
         switch ((push_faster ? frames * 2 :
-                 push_slower ? frames / 2 : 
+                 push_slower ? frames / 2 :
                  push_a_twice? frames / 4:
                  frames) % combo_length + (start_is_bad? 20 : 0) ) {
             case 0:
@@ -94,7 +98,7 @@ static void vblank(GB_gameboy_t *gb)
                 break;
         }
     }
-    
+
     /* Detect common crashes and stop the test early */
     if (frames < test_length - 1) {
         if (gb->backtrace_size >= 0x200 + (large_stack? 0x80: 0) || (!allow_weird_sp_values && (gb->registers[GB_REGISTER_SP] >= 0xfe00 && gb->registers[GB_REGISTER_SP] < 0xff80))) {
@@ -116,7 +120,7 @@ static void vblank(GB_gameboy_t *gb)
                 break;
             }
         }
-        
+
         /* Let the test run for extra four seconds if the screen is off/disabled */
         if (!is_screen_blank || frames >= test_length + 60 * 4) {
             FILE *f = fopen(bmp_filename, "wb");
@@ -135,7 +139,7 @@ static void vblank(GB_gameboy_t *gb)
     else if (frames == test_length - 1) {
         gb->disable_rendering = false;
     }
-    
+
     frames++;
 }
 
@@ -227,7 +231,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "SameBoy Tester v" xstr(VERSION) "\n");
 
     if (argc == 1) {
-        fprintf(stderr, "Usage: %s [--dmg] [--start] [--length seconds] [--boot path to boot ROM]"
+        fprintf(stderr, "Usage: %s [--dmg] [--start] [--save] [--length seconds] [--boot path to boot ROM]"
 #ifndef _WIN32
                         " [--jobs number of tests to run simultaneously]"
 #endif
@@ -255,19 +259,24 @@ int main(int argc, char **argv)
             push_start_a = true;
             continue;
         }
-        
+
         if (strcmp(argv[i], "--length") == 0 && i != argc - 1) {
             test_length = atoi(argv[++i]) * 60;
             fprintf(stderr, "Test length is %d seconds\n", test_length / 60);
             continue;
         }
-        
+
         if (strcmp(argv[i], "--boot") == 0 && i != argc - 1) {
             fprintf(stderr, "Using boot ROM %s\n", argv[i + 1]);
             boot_rom_path = argv[++i];
             continue;
         }
-        
+
+        if (strcmp(argv[i], "--save") == 0) {
+            write_sav = true;
+            continue;
+        }
+
 #ifndef _WIN32
         if (strcmp(argv[i], "--jobs") == 0 && i != argc - 1) {
             max_forks = atoi(argv[++i]);
@@ -284,7 +293,7 @@ int main(int argc, char **argv)
                 while(wait(&wait_out) == -1);
                 current_forks--;
             }
-            
+
             current_forks++;
             if (fork() != 0) continue;
         }
@@ -295,13 +304,17 @@ int main(int argc, char **argv)
         char bitmap_path[path_length + 5]; /* At the worst case, size is strlen(path) + 4 bytes for .bmp + NULL */
         replace_extension(filename, path_length, bitmap_path, ".bmp");
         bmp_filename = &bitmap_path[0];
-        
+
         char log_path[path_length + 5];
         replace_extension(filename, path_length, log_path, ".log");
         log_filename = &log_path[0];
-        
+
+        char sav_path[path_length + 5];
+        replace_extension(filename, path_length, sav_path, ".sav");
+        sav_filename = &sav_path[0];
+
         fprintf(stderr, "Testing ROM %s\n", filename);
-        
+
         if (dmg) {
             GB_init(&gb, GB_MODEL_DMG_B);
             if (GB_load_boot_rom(&gb, boot_rom_path? boot_rom_path : executable_relative_path("dmg_boot.bin"))) {
@@ -316,18 +329,18 @@ int main(int argc, char **argv)
                 exit(1);
             }
         }
-        
+
         GB_set_vblank_callback(&gb, (GB_vblank_callback_t) vblank);
         GB_set_pixels_output(&gb, &bitmap[0]);
         GB_set_rgb_encode_callback(&gb, rgb_encode);
         GB_set_log_callback(&gb, log_callback);
         GB_set_async_input_callback(&gb, async_input_callback);
-        
+
         if (GB_load_rom(&gb, filename)) {
             perror("Failed to load ROM");
             exit(1);
         }
-        
+
         /* Game specific hacks for start attempt automations */
         /* It's OK. No overflow is possible here. */
         start_is_not_first = strcmp((const char *)(gb.rom + 0x134), "NEKOJARA") == 0 ||
@@ -347,12 +360,12 @@ int main(int argc, char **argv)
                      (memcmp((const char *)(gb.rom + 0x134), "MINIMADNESSBMIE", strlen("MINIMADNESSBMIE")) == 0 &&
                       gb.rom[0x14e] == 0x6c);
 
-        
+
         /* This game temporarily sets SP to OAM RAM */
         allow_weird_sp_values = strcmp((const char *)(gb.rom + 0x134), "WDL:TT") == 0 ||
         /* Some mooneye-gb tests abuse the stack */
                                 strcmp((const char *)(gb.rom + 0x134), "mooneye-gb test") == 0;
-        
+
         /* This game uses some recursive algorithms and therefore requires quite a large call stack */
         large_stack = memcmp((const char *)(gb.rom + 0x134), "MICRO EPAK1BM", strlen("MICRO EPAK1BM")) == 0 ||
                       strcmp((const char *)(gb.rom + 0x134), "TECMO BOWL") == 0;
@@ -375,10 +388,14 @@ int main(int argc, char **argv)
                 frames = test_length - 1;
             }
         }
-        
+
         if (log_file) {
             fclose(log_file);
             log_file = NULL;
+        }
+
+        if (write_sav) {
+            GB_save_battery(&gb, sav_filename);
         }
         
         GB_free(&gb);
@@ -394,4 +411,3 @@ int main(int argc, char **argv)
 #endif
     return 0;
 }
-
